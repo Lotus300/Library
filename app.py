@@ -446,23 +446,27 @@ with app_tabs[1]:
             # 解析スレッドからセッションステートへISBNが渡された際のイベントハンドラ割り込み
             if st.session_state.last_scanned_isbn:
                 scanned_isbn_code = st.session_state.last_scanned_isbn
-                st.session_state.last_scanned_isbn = None # 連続多重検知の抑制クリア
+                st.session_state.last_scanned_isbn = None
                 
-                # openBD APIによるメタデータ自動補完
                 fetched_meta = fetch_book_metadata_from_openbd(scanned_isbn_code)
                 if fetched_meta:
                     db_status, created_rec = upsert_book_to_supabase(fetched_meta)
                     
+                    # クラッシュ防止：st.toast の代わりにカメラエリア専用の静的メッセージボックスを使用
                     if db_status == "success":
-                        st.toast(f"🎉 登録成功: {fetched_meta['title']} ({fetched_meta['volume']}巻)", icon="✅")
-                        trigger_device_vibration("success") # 画面仕様書：成功時は短く1回振動
-                        st.session_state.scan_history.insert(0, fetched_meta) # 連続スキャンの履歴先頭に追加
+                        st.success(f"✅ 登録成功: {fetched_meta['title']}")
+                        trigger_device_vibration("success")
+                        st.session_state.scan_history.insert(0, fetched_meta)
+                        # 小さなウェイトを挟むことで、ブラウザ側のDOM更新時間を確保する
+                        import time
+                        time.sleep(0.5)
+                        st.rerun()
                     elif db_status == "duplicate":
-                        st.toast(f"⚠️ 既に登録されています: {fetched_meta['title']}", icon="ℹ️")
-                        trigger_device_vibration("duplicate") # 画面仕様書：重複時は長めに1回振動
+                        st.warning(f"ℹ️ 既に登録されています: {fetched_meta['title']}")
+                        trigger_device_vibration("duplicate")
                 else:
-                    st.toast("❌ openBDに該当書籍がありません。完全手動登録を使用してください。", icon="🚨")
-                    trigger_device_vibration("failed") # 画面仕様書：該当なし時は短く2回振動
+                    st.error("🚨 openBDに該当書籍がありません。")
+                    trigger_device_vibration("failed")
                     
         with history_layout:
             st.markdown(f"#### 直近のスキャン登録履歴 (最大 {layout_columns_limit} 件を表示)")
