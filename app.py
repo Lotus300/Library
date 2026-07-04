@@ -18,15 +18,12 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# 本番公開時およびGitHub共有時のオープンソース規約に準拠（シークレットのハードコード完全排除）
 if not SUPABASE_URL or not SUPABASE_KEY:
     st.error("【環境変数エラー】.envファイル、またはデプロイ環境の設定に 'SUPABASE_URL' と 'SUPABASE_KEY' を指定してください。")
     st.stop()
 
-# Supabaseクライアントの初期化
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ページ基本設定（レスポンシブWeb対応のワイドレイアウト強制）
 st.set_page_config(
     page_title="蔵書管理システム 📚",
     page_icon="📚",
@@ -34,15 +31,13 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# セッション状態（State）の厳格な初期化管理
 if "current_series" not in st.session_state:
-    st.session_state.current_series = None         # 現在ドリルダウン展開しているシリーズフォルダ名
+    st.session_state.current_series = None
 if "last_scanned_isbn" not in st.session_state:
-    st.session_state.last_scanned_isbn = None     # 直近にカメラが検知したISBN一時バッファ
+    st.session_state.last_scanned_isbn = None
 if "scan_history" not in st.session_state:
-    st.session_state.scan_history = []             # バーコード連続登録の成功履歴リスト
+    st.session_state.scan_history = []
 if "user_session" not in st.session_state:
-    # 認証要件に基づくモックセッション（本番実装時はSupabase Auth経由のUUIDを動的に割当）
     st.session_state.user_session = {
         "id": "00000000-0000-0000-0000-000000000000", 
         "email": "demo-user@example.com"
@@ -51,16 +46,13 @@ if "user_session" not in st.session_state:
 USER_ID = st.session_state.user_session["id"]
 
 # ==============================================================================
-# 1. フロントエンド連携：JavaScript注入ユーティリティ（触覚フィードバック）
+# 1. フロントエンド連携：JavaScript注入ユーティリティ
 # ==============================================================================
 def trigger_device_vibration(pattern_type: str):
-    """
-    ブラウザのVibration APIを直接制御するJavaScriptをインジェクションする。
-    """
     patterns = {
-        "success": "100",                 # 正常登録：短く1回「ブルッ」
-        "duplicate": "300",               # 重複警告：少し長めに「ブーーー」
-        "failed": "[100, 50, 100]"        # エラー/該当なし：短く2回「ブッ、ブッ」
+        "success": "100",
+        "duplicate": "300",
+        "failed": "[100, 50, 100]"
     }
     pattern = patterns.get(pattern_type, "100")
     js_script = f"""
@@ -73,12 +65,9 @@ def trigger_device_vibration(pattern_type: str):
     st.components.v1.html(js_script, height=0, width=0, scroller=False)
 
 # ==============================================================================
-# 2. データアクセス・外部API連携層（ビジネスロジック）
+# 2. データアクセス・外部API連携層
 # ==============================================================================
 def fetch_book_metadata_from_openbd(isbn: str) -> dict:
-    """
-    openBD APIにリクエストを送り、JLA/ONIX準拠の書誌データをパースして取得する。
-    """
     clean_isbn = re.sub(r"\D", "", isbn)
     if not clean_isbn:
         return None
@@ -120,12 +109,18 @@ def fetch_book_metadata_from_openbd(isbn: str) -> dict:
     return None
 
 def upsert_book_to_supabase(book_payload: dict) -> tuple:
-    """
-    Supabaseのbooksテーブルへレコードの登録を試みる。
-    """
     book_payload["user_id"] = USER_ID
+    # 全てのフィールドを確実に含める
+    defaults = {
+        "isbn": "", "title": "", "subtitle": "", "author": "", 
+        "publisher": "", "volume": 1, "series": "", "pubdate": "", 
+        "cover": "", "description": "", "status": "未読", 
+        "location": "", "memo": ""
+    }
+    final_payload = {**defaults, **book_payload}
+    
     try:
-        res = supabase.table("books").insert(book_payload).execute()
+        res = supabase.table("books").insert(final_payload).execute()
         if res.data:
             return "success", res.data[0]
     except Exception as e:
@@ -136,7 +131,7 @@ def upsert_book_to_supabase(book_payload: dict) -> tuple:
     return "error", "未知のデータベース割り込みレスポンス"
 
 # ==============================================================================
-# 3. 画面プレゼンテーション層（Streamlit UI設計）
+# 3. 画面プレゼンテーション層
 # ==============================================================================
 
 is_mobile_width = st.sidebar.checkbox("📱 スマホ表示モード (最大3列) でシミュレート", value=False)
@@ -145,7 +140,7 @@ layout_columns_limit = 3 if is_mobile_width else 6
 app_tabs = st.tabs(["📚 蔵書一覧・検索", "📷 バーコード高速登録", "⚙️ システムデータ管理"])
 
 # ------------------------------------------------------------------------------
-# 3.1 【画面1】書籍一覧画面（メイン・ドリルダウン対応）
+# 3.1 【画面1】書籍一覧画面
 # ------------------------------------------------------------------------------
 with app_tabs[0]:
     if st.session_state.current_series is not None:
@@ -168,9 +163,9 @@ with app_tabs[0]:
                     if idx < len(series_books):
                         b_item = series_books[idx]
                         with grid_cols[j]:
-                            thumb_url = b_item["cover"] if b_item["cover"] else "https://via.placeholder.com/150x210?text=No+Image"
+                            thumb_url = b_item.get("cover") if b_item.get("cover") else "https://via.placeholder.com/150x210?text=No+Image"
                             st.image(thumb_url, use_container_width=True)
-                            st.caption(f"**第 {b_item['volume']} 巻**")
+                            st.caption(f"**第 {b_item.get('volume', 1)} 巻**")
                             if st.button("詳細・編集", key=f"btn_s_detail_{b_item['id']}", use_container_width=True):
                                 render_book_dialog_form(b_item)
                                 
@@ -188,25 +183,32 @@ with app_tabs[0]:
             st.info("蔵書データがありません。「バーコード高速登録」から本を追加してください。")
         else:
             df_books = pd.DataFrame(raw_data)
+            
+            # 全ての検索対象カラムを文字列型に変換して検索漏れを防ぐ
+            search_columns = ["title", "author", "publisher", "isbn", "subtitle", "series", "location"]
+            for col in search_columns:
+                if col in df_books.columns:
+                    df_books[col] = df_books[col].fillna("").astype(str)
+            
+            # 検索フィルタリング
             if search_term:
-                df_books = df_books[
-                    df_books["title"].str.contains(search_term, case=False, na=False) |
-                    df_books["author"].str.contains(search_term, case=False, na=False) |
-                    df_books["publisher"].str.contains(search_term, case=False, na=False) |
-                    df_books["isbn"].str.contains(search_term, case=False, na=False)
-                ]
+                search_pattern = f".*{re.escape(search_term)}.*"
+                mask = df_books[search_columns].apply(lambda x: x.str.contains(search_pattern, case=False, na=False)).any(axis=1)
+                df_books = df_books[mask]
+                
             if f_status != "すべて":
                 df_books = df_books[df_books["status"] == f_status]
             if f_location:
-                df_books = df_books[df_books["location"].str.contains(f_location, case=False, na=False)]
+                df_books = df_books[df_books["location"].str.contains(re.escape(f_location), case=False, na=False)]
                 
             arranged_items = []
             registered_series_set = set()
             
-            # seriesフィールドがNoneやNaNの場合の処理
+            # シリーズ物のグループ化
             df_books["series"] = df_books["series"].fillna("")
             grouped_df_series = df_books[df_books["series"] != ""].groupby("series")
             
+            # 検索結果を表示リストに変換
             for _, b_row in df_books.iterrows():
                 s_name = b_row["series"]
                 if s_name:
@@ -217,7 +219,7 @@ with app_tabs[0]:
                             "type": "folder",
                             "key_name": s_name,
                             "count": len(s_elements),
-                            "cover": lead_book["cover"]
+                            "cover": lead_book.get("cover", "")
                         })
                         registered_series_set.add(s_name)
                 else:
@@ -225,7 +227,7 @@ with app_tabs[0]:
                         "type": "single",
                         "key_name": b_row["title"],
                         "book_payload": b_row.to_dict(),
-                        "cover": b_row["cover"]
+                        "cover": b_row.get("cover", "")
                     })
                     
             if not arranged_items:
@@ -286,18 +288,23 @@ def render_book_dialog_form(book_record: dict):
         body_col1, body_col2 = st.container(), st.container()
         
     with body_col1:
-        img_src = book_record["cover"] if book_record["cover"] else "https://via.placeholder.com/150x210?text=No+Image"
+        img_src = book_record.get("cover") if book_record.get("cover") else "https://via.placeholder.com/150x210?text=No+Image"
         st.image(img_src, use_container_width=True)
         st.caption(f"ISBNコード: {book_record.get('isbn', '未登録')}")
         
     with body_col2:
-        edit_title = st.text_input("書籍タイトル (必須)", value=book_record["title"])
+        edit_title = st.text_input("書籍タイトル (必須)", value=book_record.get("title", ""))
         edit_subtitle = st.text_input("サブタイトル (任意)", value=book_record.get("subtitle", ""))
-        edit_author = st.text_input("著者名 (必須)", value=book_record["author"])
-        edit_publisher = st.text_input("出版社 (必須)", value=book_record["publisher"])
-        edit_volume = st.number_input("巻数", min_value=1, value=int(book_record["volume"]))
+        edit_author = st.text_input("著者名 (必須)", value=book_record.get("author", ""))
+        edit_publisher = st.text_input("出版社 (必須)", value=book_record.get("publisher", ""))
+        edit_volume = st.number_input("巻数", min_value=1, value=int(book_record.get("volume", 1)))
         edit_series = st.text_input("シリーズ・フォルダ紐づけ名", value=book_record.get("series", ""))
-        edit_status = st.selectbox("読書ステータス", ["未読", "読書中", "読了"], index=["未読", "読書中", "読了"].index(book_record.get("status", "未読")))
+        
+        status_list = ["未読", "読書中", "読了"]
+        current_status = book_record.get("status", "未読")
+        status_index = status_list.index(current_status) if current_status in status_list else 0
+        edit_status = st.selectbox("読書ステータス", status_list, index=status_index)
+        
         edit_location = st.text_input("保管棚・保管場所番号", value=book_record.get("location", ""))
         edit_memo = st.text_area("ユーザー個別メモ欄", value=book_record.get("memo", ""))
         
@@ -327,7 +334,7 @@ def render_book_dialog_form(book_record: dict):
                 st.rerun()
 
 # ------------------------------------------------------------------------------
-# 3.3 【画面2】書籍登録画面（WebRTC連動リアルタイムスキャン機能）
+# 3.3 【画面2】書籍登録画面
 # ------------------------------------------------------------------------------
 with app_tabs[1]:
     st.title("新しい本を登録する")
@@ -343,7 +350,6 @@ with app_tabs[1]:
             st.markdown("#### カメラフレーム内中央の「赤枠ターゲット」に本のバーコード(上側)を合わせてください。")
             scan_message_spot = st.empty() 
             
-            # プロセッサクラスの定義（VideoProcessorBaseを使用）
             class OpenCVIsbnProcessor(VideoProcessorBase):
                 def __init__(self):
                     self.result_queue = queue.Queue()
@@ -352,31 +358,24 @@ with app_tabs[1]:
                 def recv(self, frame):
                     img = frame.to_ndarray(format="bgr24")
                     frame_h, frame_w, _ = img.shape
-                    
-                    # ROI（スキャン範囲）の定義
                     box_x1, box_y1 = int(frame_w * 0.15), int(frame_h * 0.35)
                     box_x2, box_y2 = int(frame_w * 0.85), int(frame_h * 0.65)
-                    
                     roi = img[box_y1:box_y2, box_x1:box_x2]
                     
                     if roi.size > 0:
-                        # 画像処理による読み取り精度向上
                         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
                         _, threshed = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                        
                         detected_barcodes = decode(threshed)
                         if not detected_barcodes:
                             detected_barcodes = decode(roi)
                             
                         for bc in detected_barcodes:
                             raw_code = bc.data.decode("utf-8")
-                            # 日本の書籍ISBN（978または979から始まる13桁）を対象
                             if len(raw_code) == 13 and (raw_code.startswith("978") or raw_code.startswith("979")):
                                 if raw_code != self.last_detected:
                                     self.last_detected = raw_code
                                     self.result_queue.put(raw_code)
                     
-                    # ガイド枠の描画
                     cv2.rectangle(img, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 255), 3)
                     return frame.from_ndarray(img, format="bgr24")
 
@@ -397,8 +396,6 @@ with app_tabs[1]:
             
         with history_layout:
             history_display_spot = st.container()
-            
-            # メインスレッド側でプロセッサのキューから結果を取り出す
             if webrtc_ctx.video_processor:
                 try:
                     scanned_isbn_code = webrtc_ctx.video_processor.result_queue.get_nowait()
@@ -419,8 +416,6 @@ with app_tabs[1]:
                     else:
                         scan_message_spot.error(f"🚨 openBDに該当書籍がありません。 (ISBN: {scanned_isbn_code})")
                         trigger_device_vibration("failed")
-                    
-                    # データを処理したら画面を更新
                     st.rerun()
 
             with history_display_spot:
@@ -430,9 +425,9 @@ with app_tabs[1]:
                     hist_cols = st.columns(layout_columns_limit)
                     for h_idx, h_book in enumerate(active_history):
                         with hist_cols[h_idx]:
-                            h_img = h_book["cover"] if h_book["cover"] else "https://via.placeholder.com/150x210?text=No+Image"
+                            h_img = h_book.get("cover") if h_book.get("cover") else "https://via.placeholder.com/150x210?text=No+Image"
                             st.image(h_img, use_container_width=True)
-                            st.caption(f"**{h_book['title'][:8]}...**")
+                            st.caption(f"**{h_book.get('title', '')[:8]}...**")
                 else:
                     st.write("履歴がここに並びます。")
 
