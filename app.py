@@ -376,8 +376,8 @@ with app_tabs[1]:
     
     register_mode = st.radio("入力アプローチの選択", ["📷 カメラからバーコードを連続読み取り", "⌨️ ISBN数値を手動でタイピング", "📝 白紙から完全手動フォーム入力"], horizontal=True)
     
-    # CASE A: カメラを用いたリアルタイムバーコードスキャンモード
     if register_mode == "📷 カメラからバーコードを連続読み取り":
+        # 画面割りの構成を定義（PC/スマホでカラムを調整）
         if not is_mobile_width:
             cam_layout, history_layout = st.columns([0.5, 0.5])
         else:
@@ -386,33 +386,25 @@ with app_tabs[1]:
         with cam_layout:
             st.markdown("#### カメラフレーム内中央の「赤枠ターゲット」に本のバーコード(上側)を合わせてください。")
             
-            # streamlit-webrtc 映像フレーム割り込み解析内部クラス
+            # 描画クラッシュ防止：メッセージ表示位置をカメラの上に完全に固定確保
+            scan_message_spot = st.empty() 
+            
             class OpenCVIsbnDecoder(VideoTransformerBase):
                 def transform(self, frame):
                     img_array = frame.to_ndarray(format="bgr24")
                     frame_h, frame_w, _ = img_array.shape
                     
-                    # 1. 照準枠（赤枠）の座標計算
                     box_x1, box_y1 = int(frame_w * 0.15), int(frame_h * 0.35)
                     box_x2, box_y2 = int(frame_w * 0.85), int(frame_h * 0.65)
                     
-                    # 2. 【超重要】照準枠の中（バーコードがあるエリア）だけを切り抜いて画質対策を集中
                     roi = img_array[box_y1:box_y2, box_x1:box_x2]
                     
                     if roi.size > 0:
-                        # 補正A: 映像を少し拡大してバーコードの線を太く見せる（解像度不足の補正）
                         roi_resized = cv2.resize(roi, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-                        
-                        # 補正B: 白黒（グレースケール）に変換して色ノイズをカット
                         gray = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
-                        
-                        # 補正C: 輪郭をハッキリさせる「大津の二値化」を適用（ぼやけた影をクッキリさせる）
                         _, threshed = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                         
-                        # 3. 補正済みのクッキリした画像でバーコードを解析
                         detected_barcodes = decode(threshed)
-                        
-                        # もし補正画像でダメなら、念のためオリジナルの切り抜き領域でも解析を試みる（2段構え）
                         if not detected_barcodes:
                             detected_barcodes = decode(roi)
                             
@@ -421,65 +413,67 @@ with app_tabs[1]:
                             if len(raw_code) == 13 and (raw_code.startswith("978") or raw_code.startswith("979")):
                                 st.session_state.last_scanned_isbn = raw_code
                     
-                    # 画面に表示する用の赤い案内枠を合成（ユーザー向け）
                     cv2.rectangle(img_array, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 255), 3)
                     return img_array
 
-            # WebRTCピア接続ストリーマーの起動（ブラウザのカメラパーミッション直接奪取対応）
+            # カメラコンポーネントの配置
             webrtc_streamer(
                 key="webrtc_isbn_scanner",
                 mode=WebRtcMode.SENDRECV,
                 video_transformer_factory=OpenCVIsbnDecoder,
-                # カメラデバイスへ高解像度かつオートフォーカスなどを要求する詳細設定
                 media_stream_constraints={
                     "video": {
                         "width": {"ideal": 1280, "min": 640},
                         "height": {"ideal": 720, "min": 480},
-                        "facingMode": "environment", # スマホの場合は背面カメラを優先
-                        "focusMode": "continuous"     # 可能なら継続的なオートフォーカスを要求
+                        "facingMode": "environment",
+                        "focusMode": "continuous"
                     },
                     "audio": False
                 },
                 async_processing=True
             )
             
-            # 解析スレッドからセッションステートへISBNが渡された際のイベントハンドラ割り込み
+        # 履歴表示・処理エリアを隔離して作成
+        with history_layout:
+            # 【新設計】履歴表示用の器（コンテナ）をはじめに固定で生成しておく
+            history_display_spot = st.container()
+            
             if st.session_state.last_scanned_isbn:
                 scanned_isbn_code = st.session_state.last_scanned_isbn
+                # 即座に初期化して重複処理を防ぐ
                 st.session_state.last_scanned_isbn = None
                 
                 fetched_meta = fetch_book_metadata_from_openbd(scanned_isbn_code)
                 if fetched_meta:
                     db_status, created_rec = upsert_book_to_supabase(fetched_meta)
                     
-                    # クラッシュ防止：st.toast の代わりにカメラエリア専用の静的メッセージボックスを使用
                     if db_status == "success":
-                        st.success(f"✅ 登録成功: {fetched_meta['title']}")
+                        scan_message_spot.success(f"✅ 登録成功: {fetched_meta['title']}")
                         trigger_device_vibration("success")
+                        # 履歴セッションの先頭に挿入
                         st.session_state.scan_history.insert(0, fetched_meta)
-                        # 小さなウェイトを挟むことで、ブラウザ側のDOM更新時間を確保する
-                        import time
-                        time.sleep(0.5)
-                        st.rerun()
+                        # 【重要】st.rerun() を呼ぶのをやめ、このまま下の描画処理へスムーズに流す
+                        
                     elif db_status == "duplicate":
-                        st.warning(f"ℹ️ 既に登録されています: {fetched_meta['title']}")
+                        scan_message_spot.warning(f"ℹ️ 既に登録されています: {fetched_meta['title']}")
                         trigger_device_vibration("duplicate")
                 else:
-                    st.error("🚨 openBDに該当書籍がありません。")
+                    scan_message_spot.error("🚨 openBDに該当書籍がありません。")
                     trigger_device_vibration("failed")
-                    
-        with history_layout:
-            st.markdown(f"#### 直近のスキャン登録履歴 (最大 {layout_columns_limit} 件を表示)")
-            if st.session_state.scan_history:
-                active_history = st.session_state.scan_history[:layout_columns_limit]
-                hist_cols = st.columns(layout_columns_limit)
-                for h_idx, h_book in enumerate(active_history):
-                    with hist_cols[h_idx]:
-                        h_img = h_book["cover"] if h_book["cover"] else "https://via.placeholder.com/150x210?text=No+Image"
-                        st.image(h_img, use_container_width=True)
-                        st.caption(f"**{h_book['title'][:8]}...**")
-            else:
-                st.write("カメラをかざすとここに直近の成功履歴が並びます（連続登録対応UI）。")
+            
+            # 固定したコンテナ（history_display_spot）の内部にのみ履歴を描画する
+            with history_display_spot:
+                st.markdown(f"#### 直近のスキャン登録履歴 (最大 {layout_columns_limit} 件を表示)")
+                if st.session_state.scan_history:
+                    active_history = st.session_state.scan_history[:layout_columns_limit]
+                    hist_cols = st.columns(layout_columns_limit)
+                    for h_idx, h_book in enumerate(active_history):
+                        with hist_cols[h_idx]:
+                            h_img = h_book["cover"] if h_book["cover"] else "https://via.placeholder.com/150x210?text=No+Image"
+                            st.image(h_img, use_container_width=True)
+                            st.caption(f"**{h_book['title'][:8]}...**")
+                else:
+                    st.write("履歴がここに並びます。")
 
     # CASE B: ISBN数値の手動タイピング登録
     elif register_mode == "⌨️ ISBN数値を手動でタイピング":
