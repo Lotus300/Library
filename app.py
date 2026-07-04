@@ -377,103 +377,121 @@ with app_tabs[1]:
     register_mode = st.radio("入力アプローチの選択", ["📷 カメラからバーコードを連続読み取り", "⌨️ ISBN数値を手動でタイピング", "📝 白紙から完全手動フォーム入力"], horizontal=True)
     
     if register_mode == "📷 カメラからバーコードを連続読み取り":
-        # 画面割りの構成を定義（PC/スマホでカラムを調整）
-        if not is_mobile_width:
-            cam_layout, history_layout = st.columns([0.5, 0.5])
-        else:
-            cam_layout, history_layout = st.container(), st.container()
-            
-        with cam_layout:
-            st.markdown("#### カメラフレーム内中央の「赤枠ターゲット」に本のバーコード(上側)を合わせてください。")
-            
-            # 描画クラッシュ防止：メッセージ表示位置をカメラの上に完全に固定確保
-            scan_message_spot = st.empty() 
-            
-            class OpenCVIsbnDecoder(VideoTransformerBase):
-                def transform(self, frame):
-                    img_array = frame.to_ndarray(format="bgr24")
-                    frame_h, frame_w, _ = img_array.shape
-                    
-                    box_x1, box_y1 = int(frame_w * 0.15), int(frame_h * 0.35)
-                    box_x2, box_y2 = int(frame_w * 0.85), int(frame_h * 0.65)
-                    
-                    roi = img_array[box_y1:box_y2, box_x1:box_x2]
-                    
-                    if roi.size > 0:
-                        roi_resized = cv2.resize(roi, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-                        gray = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
-                        _, threshed = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                        
-                        detected_barcodes = decode(threshed)
-                        if not detected_barcodes:
-                            detected_barcodes = decode(roi)
-                            
-                        for bc in detected_barcodes:
-                            raw_code = bc.data.decode("utf-8")
-                            if len(raw_code) == 13 and (raw_code.startswith("978") or raw_code.startswith("979")):
-                                st.session_state.last_scanned_isbn = raw_code
-                    
-                    cv2.rectangle(img_array, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 255), 3)
-                    return img_array
-
-            # カメラコンポーネントの配置
-            webrtc_streamer(
-                key="webrtc_isbn_scanner",
-                mode=WebRtcMode.SENDRECV,
-                video_transformer_factory=OpenCVIsbnDecoder,
-                media_stream_constraints={
-                    "video": {
-                        "width": {"ideal": 1280, "min": 640},
-                        "height": {"ideal": 720, "min": 480},
-                        "facingMode": "environment",
-                        "focusMode": "continuous"
-                    },
-                    "audio": False
-                },
-                async_processing=True
-            )
-            
-        # 履歴表示・処理エリアを隔離して作成
-        with history_layout:
-            # 【新設計】履歴表示用の器（コンテナ）をはじめに固定で生成しておく
-            history_display_spot = st.container()
-            
-            if st.session_state.last_scanned_isbn:
-                scanned_isbn_code = st.session_state.last_scanned_isbn
-                # 即座に初期化して重複処理を防ぐ
-                st.session_state.last_scanned_isbn = None
+            # 画面割りの構成を定義（PC/スマホでカラムを調整）
+            if not is_mobile_width:
+                cam_layout, history_layout = st.columns([0.5, 0.5])
+            else:
+                cam_layout, history_layout = st.container(), st.container()
                 
-                fetched_meta = fetch_book_metadata_from_openbd(scanned_isbn_code)
-                if fetched_meta:
-                    db_status, created_rec = upsert_book_to_supabase(fetched_meta)
-                    
-                    if db_status == "success":
-                        scan_message_spot.success(f"✅ 登録成功: {fetched_meta['title']}")
-                        trigger_device_vibration("success")
-                        # 履歴セッションの先頭に挿入
-                        st.session_state.scan_history.insert(0, fetched_meta)
-                        # 【重要】st.rerun() を呼ぶのをやめ、このまま下の描画処理へスムーズに流す
+            with cam_layout:
+                st.markdown("#### カメラフレーム内中央の「赤枠ターゲット」に本のバーコード(上側)を合わせてください。")
+                
+                # 描画クラッシュ防止：メッセージ表示位置をカメラの上に完全に固定確保
+                scan_message_spot = st.empty() 
+                
+                # 【重要】マルチスレッド安全にデータを仲介するためのキュー(Queue)を準備
+                import queue
+                if "isbn_queue" not in st.session_state:
+                    st.session_state.isbn_queue = queue.Queue()
+                
+                class OpenCVIsbnDecoder(VideoTransformerBase):
+                    def __init__(self):
+                        self.last_detected = None
+
+                    def transform(self, frame):
+                        img_array = frame.to_ndarray(format="bgr24")
+                        frame_h, frame_w, _ = img_array.shape
                         
-                    elif db_status == "duplicate":
-                        scan_message_spot.warning(f"ℹ️ 既に登録されています: {fetched_meta['title']}")
-                        trigger_device_vibration("duplicate")
-                else:
-                    scan_message_spot.error("🚨 openBDに該当書籍がありません。")
-                    trigger_device_vibration("failed")
-            
-            # 固定したコンテナ（history_display_spot）の内部にのみ履歴を描画する
-            with history_display_spot:
-                st.markdown(f"#### 直近のスキャン登録履歴 (最大 {layout_columns_limit} 件を表示)")
-                if st.session_state.scan_history:
-                    active_history = st.session_state.scan_history[:layout_columns_limit]
-                    hist_cols = st.columns(layout_columns_limit)
-                    for h_idx, h_book in enumerate(active_history):
-                        with hist_cols[h_idx]:
-                            h_img = h_book["cover"] if h_book["cover"] else "https://via.placeholder.com/150x210?text=No+Image"
-                            st.image(h_img, use_container_width=True)
-                            st.caption(f"**{h_book['title'][:8]}...**")
-                else:
-                    st.write("履歴がここに並びます。")
+                        box_x1, box_y1 = int(frame_w * 0.15), int(frame_h * 0.35)
+                        box_x2, box_y2 = int(frame_w * 0.85), int(frame_h * 0.65)
+                        
+                        roi = img_array[box_y1:box_y2, box_x1:box_x2]
+                        
+                        if roi.size > 0:
+                            roi_resized = cv2.resize(roi, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+                            gray = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
+                            _, threshed = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                            
+                            detected_barcodes = decode(threshed)
+                            if not detected_barcodes:
+                                detected_barcodes = decode(roi)
+                                
+                            for bc in detected_barcodes:
+                                raw_code = bc.data.decode("utf-8")
+                                if len(raw_code) == 13 and (raw_code.startswith("978") or raw_code.startswith("979")):
+                                    # チャタリング（同一コードの超連続検知）を簡易ガード
+                                    if raw_code != self.last_detected:
+                                        self.last_detected = raw_code
+                                        # 直接セッションを弄らず、スレッド安全なキューに放り込む
+                                        st.session_state.isbn_queue.put(raw_code)
+                        
+                        cv2.rectangle(img_array, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 255), 3)
+                        return img_array
+
+                # カメラコンポーネントの配置
+                webrtc_ctx = webrtc_streamer(
+                    key="webrtc_isbn_scanner",
+                    mode=WebRtcMode.SENDRECV,
+                    video_transformer_factory=OpenCVIsbnDecoder,
+                    media_stream_constraints={
+                        "video": {
+                            "width": {"ideal": 1280, "min": 640},
+                            "height": {"ideal": 720, "min": 480},
+                            "facingMode": "environment",
+                            "focusMode": "continuous"
+                        },
+                        "audio": False
+                    },
+                    async_processing=True
+                )
+                
+            # 履歴表示・処理エリアを隔離して作成
+            with history_layout:
+                # 履歴表示用のコンテナをはじめに固定で生成
+                history_display_spot = st.container()
+                
+                # 【重要】カメラ動作中、安全にメインスレッド側からキューを取り出す
+                scanned_isbn_code = None
+                if "isbn_queue" in st.session_state and not st.session_state.isbn_queue.empty():
+                    try:
+                        scanned_isbn_code = st.session_state.isbn_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+
+                if scanned_isbn_code:
+                    fetched_meta = fetch_book_metadata_from_openbd(scanned_isbn_code)
+                    if fetched_meta:
+                        db_status, created_rec = upsert_book_to_supabase(fetched_meta)
+                        
+                        if db_status == "success":
+                            scan_message_spot.success(f"✅ 登録成功: {fetched_meta['title']}")
+                            trigger_device_vibration("success")
+                            st.session_state.scan_history.insert(0, fetched_meta)
+                            
+                        elif db_status == "duplicate":
+                            scan_message_spot.warning(f"ℹ️ 既に登録されています: {fetched_meta['title']}")
+                            trigger_device_vibration("duplicate")
+                    else:
+                        scan_message_spot.error(f"🚨 openBDに該当書籍がありません。 (ISBN: {scanned_isbn_code})")
+                        trigger_device_vibration("failed")
+                
+                # 固定したコンテナの内部にのみ履歴を描画する
+                with history_display_spot:
+                    st.markdown(f"#### 直近のスキャン登録履歴 (最大 {layout_columns_limit} 件を表示)")
+                    if st.session_state.scan_history:
+                        active_history = st.session_state.scan_history[:layout_columns_limit]
+                        hist_cols = st.columns(layout_columns_limit)
+                        for h_idx, h_book in enumerate(active_history):
+                            with hist_cols[h_idx]:
+                                h_img = h_book["cover"] if h_book["cover"] else "https://via.placeholder.com/150x210?text=No+Image"
+                                st.image(h_img, use_container_width=True)
+                                st.caption(f"**{h_book['title'][:8]}...**")
+                    else:
+                        st.write("履歴がここに並びます。")
+                        
+                # カメラ起動中、キューにデータが入ったら画面を安全に更新させるための自動トリガー
+                if webrtc_ctx.state.playing and "isbn_queue" in st.session_state and not st.session_state.isbn_queue.empty():
+                    st.rerun()
 
     # CASE B: ISBN数値の手動タイピング登録
     elif register_mode == "⌨️ ISBN数値を手動でタイピング":
