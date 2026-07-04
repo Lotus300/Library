@@ -1,0 +1,9 @@
+streamlit>=1.35.0
+streamlit-webrtc>=0.47.0
+requests>=2.31.0
+pandas>=2.0.0
+supabase>=2.3.0
+python-dotenv>=1.0.1
+pyzbar>=0.1.9
+opencv-python-headless>=4.8.0
+pillow>=10.0.0
