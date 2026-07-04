@@ -67,46 +67,72 @@ def trigger_device_vibration(pattern_type: str):
 # ==============================================================================
 # 2. データアクセス・外部API連携層
 # ==============================================================================
+def convert_isbn10_to_isbn13(isbn10_digits: str) -> str:
+    """ISBN-10(9桁+チェックデジット)をISBN-13(978プレフィックス)に変換する。"""
+    core9 = isbn10_digits[:9]
+    prefixed = "978" + core9
+    total = 0
+    for i, ch in enumerate(prefixed):
+        d = int(ch)
+        total += d if i % 2 == 0 else d * 3
+    check_digit = (10 - (total % 10)) % 10
+    return prefixed + str(check_digit)
+
+
 def fetch_book_metadata_from_openbd(isbn: str) -> dict:
+    """
+    openBD APIから書誌情報を取得する。
+    - 「該当書籍が存在しない」場合は None を返す（正常系）。
+    - 「通信エラー・タイムアウト・不正なレスポンス」などの技術的な異常は
+      例外を送出し、呼び出し側でユーザーに具体的な原因を表示できるようにする。
+      （以前の実装は例外を print() で握りつぶしていたため、
+      ネットワーク遮断やAPI障害が起きても画面上は「見つかりません」としか
+      表示されず、原因の切り分けができなかった）
+    """
     clean_isbn = re.sub(r"\D", "", isbn)
     if not clean_isbn:
-        return None
-        
+        raise ValueError("ISBNコードの形式が正しくありません（数字のみを入力してください）。")
+
+    # 要件定義 3.1: 10桁ISBNにも対応する（openBDは13桁のみ受け付けるため変換する）
+    if len(clean_isbn) == 10:
+        clean_isbn = convert_isbn10_to_isbn13(clean_isbn)
+    elif len(clean_isbn) != 13:
+        raise ValueError(f"ISBNは10桁または13桁で入力してください（入力: {len(clean_isbn)}桁）。")
+
     url = f"https://api.openbd.jp/v1/get?isbn={clean_isbn}"
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()  # 200以外は HTTPError を送出させる
+
+    res_json = response.json()
+    if not res_json or res_json[0] is None:
+        return None  # openBDに登録がない（正常系・エラーではない）
+
+    summary = res_json[0].get("summary", {})
+    onix = res_json[0].get("onix", {})
+
+    description = "詳細情報（あらすじ）は提供されていません。"
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            res_json = response.json()
-            if res_json and res_json[0] is not None:
-                summary = res_json[0].get("summary", {})
-                onix = res_json[0].get("onix", {})
-                
-                description = "詳細情報（あらすじ）は提供されていません。"
-                try:
-                    text_content_list = onix.get("CollateralDetail", {}).get("TextContent", [])
-                    if text_content_list:
-                        description = text_content_list[0].get("Text", description)
-                except Exception:
-                    pass
-                
-                return {
-                    "isbn": clean_isbn,
-                    "title": summary.get("title", "名称未設定の書籍"),
-                    "subtitle": summary.get("subtitle", ""),
-                    "author": summary.get("author", "著者不明"),
-                    "publisher": summary.get("publisher", "出版社不明"),
-                    "volume": int(summary.get("volume")) if summary.get("volume") and str(summary.get("volume")).isdigit() else 1,
-                    "series": summary.get("series", ""),
-                    "pubdate": summary.get("pubdate", ""),
-                    "cover": summary.get("cover", ""),
-                    "description": description,
-                    "status": "未読",
-                    "location": "",
-                    "memo": ""
-                }
-    except Exception as e:
-        print(f"API通信エラー: {str(e)}")
-    return None
+        text_content_list = onix.get("CollateralDetail", {}).get("TextContent", [])
+        if text_content_list:
+            description = text_content_list[0].get("Text", description)
+    except Exception:
+        pass
+
+    return {
+        "isbn": clean_isbn,
+        "title": summary.get("title", "名称未設定の書籍"),
+        "subtitle": summary.get("subtitle", ""),
+        "author": summary.get("author", "著者不明"),
+        "publisher": summary.get("publisher", "出版社不明"),
+        "volume": int(summary.get("volume")) if summary.get("volume") and str(summary.get("volume")).isdigit() else 1,
+        "series": summary.get("series", ""),
+        "pubdate": summary.get("pubdate", ""),
+        "cover": summary.get("cover", ""),
+        "description": description,
+        "status": "未読",
+        "location": "",
+        "memo": ""
+    }
 
 def upsert_book_to_supabase(book_payload: dict) -> tuple:
     book_payload["user_id"] = USER_ID
@@ -136,6 +162,76 @@ def upsert_book_to_supabase(book_payload: dict) -> tuple:
 
 is_mobile_width = st.sidebar.checkbox("📱 スマホ表示モード (最大3列) でシミュレート", value=False)
 layout_columns_limit = 3 if is_mobile_width else 6
+
+# ------------------------------------------------------------------------------
+# 3.2 【ダイアログ】書籍詳細・編集・削除ポップアップ
+# ------------------------------------------------------------------------------
+@st.dialog("書籍詳細・データ編集")
+def render_book_dialog_form(book_record: dict):
+    head_col1, head_col2 = st.columns([0.75, 0.25])
+    with head_col1:
+        st.write("#### 登録台帳データ")
+    with head_col2:
+        if st.button("🗑️ データを削除", key=f"dlg_del_{book_record['id']}", help="注意：この本を本棚から完全に抹消します"):
+            st.error("【最終警告】本当に削除しますか？この操作は取り消せません。")
+            if st.button("はい、本当に削除します", key=f"dlg_confirm_del_{book_record['id']}", type="primary"):
+                supabase.table("books").delete().eq("id", book_record["id"]).execute()
+                st.success("削除処理が正常完了しました。")
+                st.session_state.current_series = None
+                st.rerun()
+
+    st.write("---")
+    if not is_mobile_width:
+        body_col1, body_col2 = st.columns([0.4, 0.6])
+    else:
+        body_col1, body_col2 = st.container(), st.container()
+        
+    with body_col1:
+        img_src = book_record.get("cover") if book_record.get("cover") else "https://via.placeholder.com/150x210?text=No+Image"
+        st.image(img_src, use_container_width=True)
+        st.caption(f"ISBNコード: {book_record.get('isbn', '未登録')}")
+        
+    with body_col2:
+        edit_title = st.text_input("書籍タイトル (必須)", value=book_record.get("title", ""))
+        edit_subtitle = st.text_input("サブタイトル (任意)", value=book_record.get("subtitle", ""))
+        edit_author = st.text_input("著者名 (必須)", value=book_record.get("author", ""))
+        edit_publisher = st.text_input("出版社 (必須)", value=book_record.get("publisher", ""))
+        edit_volume = st.number_input("巻数", min_value=1, value=int(book_record.get("volume", 1)))
+        edit_series = st.text_input("シリーズ・フォルダ紐づけ名", value=book_record.get("series", ""))
+        
+        status_list = ["未読", "読書中", "読了"]
+        current_status = book_record.get("status", "未読")
+        status_index = status_list.index(current_status) if current_status in status_list else 0
+        edit_status = st.selectbox("読書ステータス", status_list, index=status_index)
+        
+        edit_location = st.text_input("保管棚・保管場所番号", value=book_record.get("location", ""))
+        edit_memo = st.text_area("ユーザー個別メモ欄", value=book_record.get("memo", ""))
+        
+        st.write("**openBD提供の作品紹介あらすじ:**")
+        if is_mobile_width:
+            with st.expander("あらすじ詳細を展開表示"):
+                st.caption(book_record.get("description", ""))
+        else:
+            st.info(book_record.get("description", "データなし"))
+            
+        if st.button("更新内容を本棚に保存する", type="primary", use_container_width=True):
+            if not edit_title or not edit_author or not edit_publisher:
+                st.error("必須項目（タイトル・著者・出版社）が空欄です。")
+            else:
+                supabase.table("books").update({
+                    "title": edit_title,
+                    "subtitle": edit_subtitle,
+                    "author": edit_author,
+                    "publisher": edit_publisher,
+                    "volume": int(edit_volume),
+                    "series": edit_series,
+                    "status": edit_status,
+                    "location": edit_location,
+                    "memo": edit_memo
+                }).eq("id", book_record["id"]).execute()
+                st.success("書籍台帳データを正常に書き換えました。")
+                st.rerun()
+
 
 app_tabs = st.tabs(["📚 蔵書一覧・検索", "📷 バーコード高速登録", "⚙️ システムデータ管理"])
 
@@ -265,75 +361,6 @@ with app_tabs[0]:
                                         render_book_dialog_form(render_target["book_payload"])
 
 # ------------------------------------------------------------------------------
-# 3.2 【ダイアログ】書籍詳細・編集・削除ポップアップ
-# ------------------------------------------------------------------------------
-@st.dialog("書籍詳細・データ編集")
-def render_book_dialog_form(book_record: dict):
-    head_col1, head_col2 = st.columns([0.75, 0.25])
-    with head_col1:
-        st.write("#### 登録台帳データ")
-    with head_col2:
-        if st.button("🗑️ データを削除", key=f"dlg_del_{book_record['id']}", help="注意：この本を本棚から完全に抹消します"):
-            st.error("【最終警告】本当に削除しますか？この操作は取り消せません。")
-            if st.button("はい、本当に削除します", key=f"dlg_confirm_del_{book_record['id']}", type="primary"):
-                supabase.table("books").delete().eq("id", book_record["id"]).execute()
-                st.success("削除処理が正常完了しました。")
-                st.session_state.current_series = None
-                st.rerun()
-
-    st.write("---")
-    if not is_mobile_width:
-        body_col1, body_col2 = st.columns([0.4, 0.6])
-    else:
-        body_col1, body_col2 = st.container(), st.container()
-        
-    with body_col1:
-        img_src = book_record.get("cover") if book_record.get("cover") else "https://via.placeholder.com/150x210?text=No+Image"
-        st.image(img_src, use_container_width=True)
-        st.caption(f"ISBNコード: {book_record.get('isbn', '未登録')}")
-        
-    with body_col2:
-        edit_title = st.text_input("書籍タイトル (必須)", value=book_record.get("title", ""))
-        edit_subtitle = st.text_input("サブタイトル (任意)", value=book_record.get("subtitle", ""))
-        edit_author = st.text_input("著者名 (必須)", value=book_record.get("author", ""))
-        edit_publisher = st.text_input("出版社 (必須)", value=book_record.get("publisher", ""))
-        edit_volume = st.number_input("巻数", min_value=1, value=int(book_record.get("volume", 1)))
-        edit_series = st.text_input("シリーズ・フォルダ紐づけ名", value=book_record.get("series", ""))
-        
-        status_list = ["未読", "読書中", "読了"]
-        current_status = book_record.get("status", "未読")
-        status_index = status_list.index(current_status) if current_status in status_list else 0
-        edit_status = st.selectbox("読書ステータス", status_list, index=status_index)
-        
-        edit_location = st.text_input("保管棚・保管場所番号", value=book_record.get("location", ""))
-        edit_memo = st.text_area("ユーザー個別メモ欄", value=book_record.get("memo", ""))
-        
-        st.write("**openBD提供の作品紹介あらすじ:**")
-        if is_mobile_width:
-            with st.expander("あらすじ詳細を展開表示"):
-                st.caption(book_record.get("description", ""))
-        else:
-            st.info(book_record.get("description", "データなし"))
-            
-        if st.button("更新内容を本棚に保存する", type="primary", use_container_width=True):
-            if not edit_title or not edit_author or not edit_publisher:
-                st.error("必須項目（タイトル・著者・出版社）が空欄です。")
-            else:
-                supabase.table("books").update({
-                    "title": edit_title,
-                    "subtitle": edit_subtitle,
-                    "author": edit_author,
-                    "publisher": edit_publisher,
-                    "volume": int(edit_volume),
-                    "series": edit_series,
-                    "status": edit_status,
-                    "location": edit_location,
-                    "memo": edit_memo
-                }).eq("id", book_record["id"]).execute()
-                st.success("書籍台帳データを正常に書き換えました。")
-                st.rerun()
-
-# ------------------------------------------------------------------------------
 # 3.3 【画面2】書籍登録画面
 # ------------------------------------------------------------------------------
 with app_tabs[1]:
@@ -403,18 +430,28 @@ with app_tabs[1]:
                     scanned_isbn_code = None
 
                 if scanned_isbn_code:
-                    fetched_meta = fetch_book_metadata_from_openbd(scanned_isbn_code)
-                    if fetched_meta:
-                        db_status, created_rec = upsert_book_to_supabase(fetched_meta)
-                        if db_status == "success":
-                            scan_message_spot.success(f"✅ 登録成功: {fetched_meta['title']}")
-                            trigger_device_vibration("success")
-                            st.session_state.scan_history.insert(0, fetched_meta)
-                        elif db_status == "duplicate":
-                            scan_message_spot.warning(f"ℹ️ 既に登録されています: {fetched_meta['title']}")
-                            trigger_device_vibration("duplicate")
-                    else:
-                        scan_message_spot.error(f"🚨 openBDに該当書籍がありません。 (ISBN: {scanned_isbn_code})")
+                    try:
+                        fetched_meta = fetch_book_metadata_from_openbd(scanned_isbn_code)
+                        if fetched_meta:
+                            db_status, created_rec = upsert_book_to_supabase(fetched_meta)
+                            if db_status == "success":
+                                scan_message_spot.success(f"✅ 登録成功: {fetched_meta['title']}")
+                                trigger_device_vibration("success")
+                                st.session_state.scan_history.insert(0, fetched_meta)
+                            elif db_status == "duplicate":
+                                scan_message_spot.warning(f"ℹ️ 既に登録されています: {fetched_meta['title']}")
+                                trigger_device_vibration("duplicate")
+                            else:
+                                scan_message_spot.error(f"🚨 データベース登録エラー: {created_rec}")
+                                trigger_device_vibration("failed")
+                        else:
+                            scan_message_spot.error(f"🚨 openBDに該当書籍がありません。 (ISBN: {scanned_isbn_code})")
+                            trigger_device_vibration("failed")
+                    except requests.exceptions.RequestException as e:
+                        scan_message_spot.error(f"🚨 openBD APIへの通信に失敗しました。ネットワーク設定を確認してください。詳細: {e}")
+                        trigger_device_vibration("failed")
+                    except Exception as e:
+                        scan_message_spot.error(f"🚨 予期しないエラー: {e}")
                         trigger_device_vibration("failed")
                     st.rerun()
 
@@ -436,15 +473,28 @@ with app_tabs[1]:
         if st.button("このISBNで検索・登録を実行", type="primary"):
             if typed_isbn:
                 with st.spinner("APIからデータを探索中..."):
-                    manual_meta = fetch_book_metadata_from_openbd(typed_isbn)
-                    if manual_meta:
-                        db_status, _ = upsert_book_to_supabase(manual_meta)
-                        if db_status == "success":
-                            st.success(f"登録に成功しました: {manual_meta['title']}")
-                        elif db_status == "duplicate":
-                            st.warning("この本は既にマイ本棚に登録済みです。")
-                    else:
-                        st.error("外部の書誌データベースに該当コードが見つかりません。完全手動登録へ切り替えてください。")
+                    try:
+                        manual_meta = fetch_book_metadata_from_openbd(typed_isbn)
+                        if manual_meta:
+                            db_status, db_detail = upsert_book_to_supabase(manual_meta)
+                            if db_status == "success":
+                                st.success(f"登録に成功しました: {manual_meta['title']}")
+                            elif db_status == "duplicate":
+                                st.warning("この本は既にマイ本棚に登録済みです。")
+                            else:
+                                st.error(f"データベース登録エラー: {db_detail}")
+                        else:
+                            st.error("外部の書誌データベース(openBD)に該当コードが見つかりません。完全手動登録へ切り替えてください。")
+                    except requests.exceptions.Timeout:
+                        st.error("🚨 openBD APIへの通信がタイムアウトしました。ネットワーク環境を確認してください。")
+                    except requests.exceptions.RequestException as e:
+                        st.error(f"🚨 openBD APIへの通信に失敗しました。デプロイ先のネットワーク設定（外部通信の許可）を確認してください。\n\n詳細: {e}")
+                    except ValueError as e:
+                        st.error(f"🚨 {e}")
+                    except Exception as e:
+                        st.error(f"🚨 予期しないエラーが発生しました: {e}")
+            else:
+                st.warning("ISBNコードを入力してください。")
 
     elif register_mode == "📝 白紙から完全手動フォーム入力":
         with st.form("form_manual_add"):

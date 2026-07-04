@@ -1,1 +1,1 @@
-libzbar0t64
+libzbar0
